@@ -172,6 +172,12 @@ Run live mainnet bot:
 npm run dreamdex:bot:mainnet
 ```
 
+On Railway / most Node hosts, `npm start` now runs the same live mainnet bot entrypoint:
+
+```powershell
+npm start
+```
+
 Run one live mainnet cycle:
 
 ```powershell

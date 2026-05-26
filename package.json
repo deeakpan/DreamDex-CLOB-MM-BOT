@@ -2,8 +2,9 @@
   "name": "dreamdex-contest",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "scripts/dreamdex-bot.js",
   "scripts": {
+    "start": "node scripts/dreamdex-bot.js --config config/dreamdex.bot.mainnet.json",
     "dreamdex:bot": "node scripts/dreamdex-bot.js --config config/dreamdex.bot.settings.json",
     "dreamdex:bot:once": "node scripts/dreamdex-bot.js --config config/dreamdex.bot.settings.json --once",
     "dreamdex:bot:mainnet": "node scripts/dreamdex-bot.js --config config/dreamdex.bot.mainnet.json",
