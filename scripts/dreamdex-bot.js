@@ -283,6 +283,10 @@ function formatConsoleEvent(type, payload, filePath) {
       return `IOC skipped ${payload.market}: spreadBps=${payload.spreadBps} max=${payload.maxSpreadBps}`;
     case 'takerSkippedBelowCost':
       return `IOC hold ${payload.market}: bid=${payload.sellPrice} min=${payload.minimumSellPrice}`;
+    case 'makerSkippedBidInsufficientQuote':
+      return `IOC skipped ${payload.market}: insufficient quote required=${payload.requiredQuote} wallet=${payload.quoteWallet ?? 'n/a'} vault=${payload.quoteVault ?? 'n/a'}`;
+    case 'makerSkippedAskInsufficientBase':
+      return `IOC skipped ${payload.market}: insufficient base required=${payload.requiredBase} available=${payload.availableBase ?? 'n/a'} wallet=${payload.baseWallet ?? 'n/a'} vault=${payload.baseVault ?? 'n/a'}`;
     case 'inventoryCostLoaded':
       return `Cost loaded ${payload.market}: lastBuy=${payload.lastInventoryBuyPrice}`;
     case 'inventoryCostUpdated':
@@ -1725,6 +1729,7 @@ async function runMakerSpreadStrategy(ctx, strategy, state) {
       ctx.logger.event('makerSkippedBidInsufficientQuote', {
         market: strategy.market,
         requiredQuote,
+        quoteWallet: walletBalances.quoteWallet,
         quoteVault: balances.quoteVault,
       });
     }
@@ -1741,6 +1746,8 @@ async function runMakerSpreadStrategy(ctx, strategy, state) {
       ctx.logger.event('makerSkippedAskInsufficientBase', {
         market: strategy.market,
         requiredBase: quantity,
+        availableBase: balances.baseVault,
+        baseWallet: walletBalances.baseWallet,
         baseVault: balances.baseVault,
       });
     }
@@ -1822,6 +1829,10 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
   let sideLabel = null;
   let funding = null;
   const askFunding = selectTakerFunding('ask', balances, walletBalances, requiredQuote);
+  const hasAskDustInventory =
+    askFunding &&
+    askFunding.availableQuantity > 0n &&
+    askFunding.availableQuantity < marketContext.minQuantity;
   if (askFunding) {
     if (minimumSellPrice !== null && sellPrice < minimumSellPrice) {
       ctx.logger.event('takerSkippedBelowCost', {
@@ -1832,9 +1843,12 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
       });
       return;
     }
-    sideLabel = 'ask';
-    funding = askFunding;
-  } else {
+    if (!hasAskDustInventory) {
+      sideLabel = 'ask';
+      funding = askFunding;
+    }
+  }
+  if (!sideLabel) {
     const bidFunding = selectTakerFunding('bid', balances, walletBalances, requiredQuote);
     if (bidFunding) {
       sideLabel = 'bid';
@@ -1843,11 +1857,22 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
   }
 
   if (!sideLabel || !funding) {
-    ctx.logger.event('makerSkippedBidInsufficientQuote', {
-      market: strategy.market,
-      requiredQuote,
-      quoteVault: balances.quoteVault,
-    });
+    if (hasAskDustInventory) {
+      ctx.logger.event('makerSkippedAskInsufficientBase', {
+        market: strategy.market,
+        requiredBase: marketContext.minQuantity,
+        availableBase: askFunding.availableQuantity,
+        baseWallet: walletBalances.baseWallet,
+        baseVault: balances.baseVault,
+      });
+    } else {
+      ctx.logger.event('makerSkippedBidInsufficientQuote', {
+        market: strategy.market,
+        requiredQuote,
+        quoteWallet: walletBalances.quoteWallet,
+        quoteVault: balances.quoteVault,
+      });
+    }
     return;
   }
 
@@ -1859,6 +1884,8 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
     ctx.logger.event('makerSkippedAskInsufficientBase', {
       market: strategy.market,
       requiredBase: quantity,
+      availableBase: orderQuantity,
+      baseWallet: walletBalances.baseWallet,
       baseVault: balances.baseVault,
     });
     return;
