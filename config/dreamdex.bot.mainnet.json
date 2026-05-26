@@ -41,7 +41,7 @@
       "pollEveryMs": 15000,
       "quantity": "10000000000000000000",
       "crossTicks": 0,
-      "maxSpreadBps": 10,
+      "maxSpreadBps": 12,
       "minRoundTripBps": 1,
       "placeBid": true,
       "placeAsk": true,
