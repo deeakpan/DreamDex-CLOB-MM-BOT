@@ -1,0 +1,77 @@
+{
+  "network": "testnet",
+  "wallet": {
+    "privateKeyEnvVar": "PRIVATE_KEY"
+  },
+  "defaults": {
+    "expireSecondsFromNow": 3600,
+    "confirmations": 1,
+    "logDir": "logs",
+    "pollIntervalMs": 15000,
+    "dryRun": false
+  },
+  "bot": {
+    "pollIntervalMs": 15000,
+    "wsStaleAfterMs": 45000,
+    "wsReconnectDelayMs": 3000,
+    "wsPingEveryMs": 25000,
+    "wsInitialDataTimeoutMs": 4000,
+    "nativeGasReserveWei": "1000000000000000000",
+    "runOnce": false,
+    "cancelManagedOrdersOnExit": true,
+    "cancelStopsOnExit": false
+  },
+  "networks": {
+    "mainnet": {
+      "rpcUrl": "https://api.infra.mainnet.somnia.network",
+      "restUrl": "https://api.dreamdex.io",
+      "wsUrl": "wss://api.dreamdex.io/v0/ws/public"
+    },
+    "testnet": {
+      "rpcUrl": "https://dream-rpc.somnia.network",
+      "restUrl": "https://stg.api.dreamdex.io",
+      "wsUrl": "wss://stg.api.dreamdex.io/v0/ws/public"
+    }
+  },
+  "strategies": [
+    {
+      "type": "makerSpread",
+      "enabled": true,
+      "market": "SOMI:USDso",
+      "pollEveryMs": 15000,
+      "quantity": "1000000000000000000",
+      "minSpreadBps": 2,
+      "improveTicks": 0,
+      "requoteThresholdTicks": 1,
+      "quoteTtlMs": 45000,
+      "placeBid": true,
+      "placeAsk": true,
+      "preferBalancedInventory": true,
+      "autoFund": true,
+      "targetBaseVaultPercent": 50,
+      "targetQuoteVaultPercent": 50,
+      "maxBaseFundPerCycle": "1000000000000000000",
+      "maxQuoteFundPerCycle": "100000000000000000",
+      "minBaseToAskPercent": 20,
+      "minQuoteToBidPercent": 20,
+      "managePoolExclusively": false,
+      "cancelWhenSpreadTooTight": false,
+      "orderType": "postOnly",
+      "selfMatchingOption": "cancelTaker",
+      "dryRun": false
+    },
+    {
+      "type": "stopGuard",
+      "enabled": false,
+      "market": "SOMI:USDso",
+      "pollEveryMs": 20000,
+      "side": "sell",
+      "quantity": "1000000000000000000",
+      "minimumVaultBalance": "1000000000000000000",
+      "stopBps": 500,
+      "pendingOrderType": "market",
+      "replaceEveryMs": 120000,
+      "dryRun": false
+    }
+  ]
+}

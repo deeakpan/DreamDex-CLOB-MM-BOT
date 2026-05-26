@@ -1,0 +1,88 @@
+{
+  "network": "mainnet",
+  "wallet": {
+    "privateKeyEnvVar": "PRIVATE_KEY"
+  },
+  "defaults": {
+    "expireSecondsFromNow": 3600,
+    "confirmations": 1,
+    "logDir": "logs",
+    "pollIntervalMs": 15000,
+    "dryRun": false
+  },
+  "bot": {
+    "pollIntervalMs": 15000,
+    "wsStaleAfterMs": 45000,
+    "wsReconnectDelayMs": 3000,
+    "wsPingEveryMs": 25000,
+    "wsInitialDataTimeoutMs": 4000,
+    "nativeGasReserveWei": "8000000000000000000",
+    "cancelAllOrdersOnStart": true,
+    "runOnce": false,
+    "cancelManagedOrdersOnExit": true,
+    "cancelStopsOnExit": false
+  },
+  "networks": {
+    "mainnet": {
+      "rpcUrl": "https://api.infra.mainnet.somnia.network",
+      "rpcUrls": [
+        "https://api.infra.mainnet.somnia.network",
+        "https://somnia.publicnode.com"
+      ],
+      "restUrl": "https://api.dreamdex.io",
+      "wsUrl": "wss://api.dreamdex.io/v0/ws/public"
+    }
+  },
+  "strategies": [
+    {
+      "type": "takerVolume",
+      "enabled": true,
+      "market": "SOMI:USDso",
+      "pollEveryMs": 15000,
+      "quantity": "10000000000000000000",
+      "crossTicks": 0,
+      "maxSpreadBps": 10,
+      "minRoundTripBps": 2,
+      "placeBid": true,
+      "placeAsk": true,
+      "autoFund": false,
+      "targetQuoteVaultPercent": 40,
+      "maxQuoteFundPerCycle": "5000000000000000000",
+      "orderType": "ioc",
+      "selfMatchingOption": "cancelTaker",
+      "dryRun": false
+    },
+    {
+      "type": "takerVolume",
+      "enabled": true,
+      "market": "WETH:USDso",
+      "pollEveryMs": 15000,
+      "quantity": "1000000000000000",
+      "crossTicks": 0,
+      "maxSpreadBps": 10,
+      "minRoundTripBps": 2,
+      "placeBid": true,
+      "placeAsk": true,
+      "autoFund": false,
+      "orderType": "ioc",
+      "selfMatchingOption": "cancelTaker",
+      "dryRun": false
+    },
+    {
+      "type": "takerVolume",
+      "enabled": true,
+      "market": "WBTC:USDso",
+      "pollEveryMs": 15000,
+      "quantity": "10000",
+      "crossTicks": 0,
+      "maxSpreadBps": 10,
+      "minRoundTripBps": 2,
+      "placeBid": true,
+      "placeAsk": true,
+      "autoFund": false,
+      "orderType": "ioc",
+      "selfMatchingOption": "cancelTaker",
+      "dryRun": false
+    }
+  ]
+}

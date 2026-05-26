@@ -1,0 +1,54 @@
+{
+  "network": "testnet",
+  "wallet": {
+    "privateKeyEnvVar": "PRIVATE_KEY"
+  },
+  "defaults": {
+    "expireSecondsFromNow": 3600,
+    "confirmations": 1,
+    "logDir": "logs"
+  },
+  "networks": {
+    "mainnet": {
+      "rpcUrl": "https://api.infra.mainnet.somnia.network",
+      "restUrl": "https://api.dreamdex.io",
+      "wsUrl": "wss://api.dreamdex.io/v0/ws/public"
+    },
+    "testnet": {
+      "rpcUrl": "https://dream-rpc.somnia.network",
+      "restUrl": "https://stg.api.dreamdex.io",
+      "wsUrl": "wss://stg.api.dreamdex.io/v0/ws/public"
+    }
+  },
+  "actions": [
+    {
+      "type": "book",
+      "market": "SOMI:USDso",
+      "side": "bid",
+      "numLevels": 5
+    },
+    {
+      "type": "simulateOrder",
+      "enabled": false,
+      "market": "SOMI:USDso",
+      "fundingSource": "wallet",
+      "side": "sell",
+      "price": "174400000000000000",
+      "quantity": "50000000000000000000",
+      "orderType": "ioc",
+      "selfMatchingOption": "cancelTaker"
+    },
+    {
+      "type": "sendOrder",
+      "enabled": false,
+      "market": "SOMI:USDso",
+      "fundingSource": "wallet",
+      "side": "sell",
+      "price": "174400000000000000",
+      "quantity": "50000000000000000000",
+      "orderType": "ioc",
+      "selfMatchingOption": "cancelTaker",
+      "requireSimulationSuccess": true
+    }
+  ]
+}

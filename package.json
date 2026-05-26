@@ -1,0 +1,28 @@
+{
+  "name": "dreamdex-contest",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dreamdex:bot": "node scripts/dreamdex-bot.js --config config/dreamdex.bot.settings.json",
+    "dreamdex:bot:once": "node scripts/dreamdex-bot.js --config config/dreamdex.bot.settings.json --once",
+    "dreamdex:bot:mainnet": "node scripts/dreamdex-bot.js --config config/dreamdex.bot.mainnet.json",
+    "dreamdex:bot:mainnet:once": "node scripts/dreamdex-bot.js --config config/dreamdex.bot.mainnet.json --once",
+    "dreamdex:state:push": "node scripts/dreamdex-sync-state.js --config config/dreamdex.bot.settings.json",
+    "dreamdex:state:push:mainnet": "node scripts/dreamdex-sync-state.js --config config/dreamdex.bot.mainnet.json",
+    "dreamdex:run": "node scripts/dreamdex-runner.js --config config/dreamdex.settings.json",
+    "dreamdex:run:mainnet": "node scripts/dreamdex-runner.js --config config/dreamdex.settings.json --network mainnet",
+    "dreamdex:run:testnet": "node scripts/dreamdex-runner.js --config config/dreamdex.settings.json --network testnet",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.106.2",
+    "dotenv": "^17.4.2",
+    "ethers": "^6.16.0",
+    "ws": "^8.21.0"
+  }
+}
