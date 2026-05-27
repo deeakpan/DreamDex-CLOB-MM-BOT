@@ -280,7 +280,12 @@ function formatConsoleEvent(type, payload, filePath) {
     case 'takerOrderPlaced':
       return `IOC sent ${payload.market} ${payload.side}: price=${payload.targetPrice} qty=${payload.quantity}`;
     case 'takerSkippedWideSpread':
+    case 'volumeMillSkippedWideSpread':
       return `IOC skipped ${payload.market}: spreadBps=${payload.spreadBps} max=${payload.maxSpreadBps}`;
+    case 'volumeMillSkippedNoLiquidity':
+      return `Volume mill skipped ${payload.market}: empty book`;
+    case 'volumeMillSkippedBuyTooSmall':
+      return `Volume mill skipped ${payload.market}: buy size below minimum`;
     case 'takerSkippedBelowCost':
       return `IOC hold ${payload.market}: bid=${payload.sellPrice} min=${payload.minimumSellPrice}`;
     case 'makerSkippedBidInsufficientQuote':
@@ -293,6 +298,8 @@ function formatConsoleEvent(type, payload, filePath) {
       return `Cost updated ${payload.market}: lastBuy=${payload.lastInventoryBuyPrice}`;
     case 'inventoryCostCleared':
       return `Cost cleared ${payload.market}`;
+    case 'inventoryCostStaleReset':
+      return `Cost basis stale-reset ${payload.market}: old=${payload.oldLastBuy} new=${payload.newLastBuy} diffBps=${payload.diffBps}`;
     case 'supabaseStateLoaded':
       return `Supabase state loaded: ${payload.botId}`;
     case 'supabaseStateSaved':
@@ -1454,6 +1461,193 @@ function computeIocTargetPrice(sideLabel, bestBid, bestAsk, tickSize, crossTicks
   return alignToTick(rawTarget, tickSize, 'down');
 }
 
+function computeIocCrossPrice(sideLabel, bestBid, bestAsk, tickSize, crossBps) {
+  if (crossBps <= 0n) {
+    return computeIocTargetPrice(sideLabel, bestBid, bestAsk, tickSize, 0n);
+  }
+  if (sideLabel === 'bid') {
+    return alignToTick((bestAsk * (10_000n + crossBps)) / 10_000n, tickSize, 'up');
+  }
+  return alignToTick((bestBid * (10_000n - crossBps)) / 10_000n, tickSize, 'down');
+}
+
+function alignToLot(value, lotSize, direction = 'down') {
+  if (lotSize <= 0n) {
+    return value;
+  }
+  if (direction === 'down') {
+    return (value / lotSize) * lotSize;
+  }
+  return ceilDiv(value, lotSize) * lotSize;
+}
+
+function parseUsdToQuoteWei(usdValue, quoteDecimals, fieldName) {
+  if (usdValue === undefined || usdValue === null || usdValue === '') {
+    throw new Error(`Missing USD amount for ${fieldName}`);
+  }
+  return ethers.parseUnits(String(usdValue), quoteDecimals);
+}
+
+function parseDepthUsageFractionBps(fraction) {
+  if (fraction === undefined || fraction === null || fraction === '') {
+    return 5_000n;
+  }
+  const parsed = Number(fraction);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
+    throw new Error(`Invalid depthUsageFraction: ${fraction}`);
+  }
+  return BigInt(Math.floor(parsed * 10_000));
+}
+
+function resolveSizePerCycleUsd(strategy) {
+  const byMarket = strategy.sizePerCycleUsdByMarket || {};
+  if (strategy.market && byMarket[strategy.market] !== undefined) {
+    return byMarket[strategy.market];
+  }
+  return strategy.sizePerCycleUsd || '2.00';
+}
+
+function resolveNativeBaseReserve(strategy, marketContext) {
+  const byMarket = strategy.nativeBaseReserveByMarket || {};
+  const raw =
+    strategy.market && byMarket[strategy.market] !== undefined
+      ? byMarket[strategy.market]
+      : strategy.nativeBaseReserve;
+  if (raw === undefined || raw === null || raw === '') {
+    return 0n;
+  }
+  return ethers.parseUnits(String(raw), marketContext.baseDecimals);
+}
+
+async function sumSideDepthQuote(poolRead, levels) {
+  let total = 0n;
+  for (const level of levels) {
+    total += await poolRead.convertToQuoteAtPriceCeil(level.quantity, level.price);
+  }
+  return total;
+}
+
+async function estimateBaseQuantityForQuoteBudget(poolRead, quoteBudget, price, lotSize, minQuantity) {
+  if (quoteBudget <= 0n || price <= 0n || minQuantity <= 0n) {
+    return 0n;
+  }
+
+  const step = lotSize > 0n ? lotSize : minQuantity;
+  let quantity = alignToLot(minQuantity, lotSize, 'down');
+  if (quantity < minQuantity) {
+    quantity = minQuantity;
+  }
+
+  let best = 0n;
+  let guard = 0;
+  while (guard < 256) {
+    guard += 1;
+    const quoteNeeded = await poolRead.convertToQuoteAtPriceCeil(quantity, price);
+    if (quoteNeeded > quoteBudget) {
+      break;
+    }
+    best = quantity;
+    quantity += step;
+  }
+
+  return best >= minQuantity ? best : 0n;
+}
+
+function getTradableWalletBase(strategy, marketContext, walletBalances) {
+  let base = walletBalances.baseWallet;
+  if (!marketContext.market.isNativeBase) {
+    return base;
+  }
+  const reserve = resolveNativeBaseReserve(strategy, marketContext);
+  if (reserve <= 0n) {
+    return base;
+  }
+  const reserved = base > reserve ? reserve : base;
+  return base > reserved ? base - reserved : 0n;
+}
+
+async function capQuantityToDepth(poolRead, quantity, price, sideDepthQuote, depthUsageFractionBps, lotSize, minQuantity) {
+  if (quantity <= 0n || price <= 0n || sideDepthQuote <= 0n) {
+    return 0n;
+  }
+  const usableDepthQuote = (sideDepthQuote * depthUsageFractionBps) / 10_000n;
+  let capped = await estimateBaseQuantityForQuoteBudget(poolRead, usableDepthQuote, price, lotSize, minQuantity);
+  if (capped === 0n) {
+    return 0n;
+  }
+  return quantity < capped ? quantity : capped;
+}
+
+async function placeTakerVolumeIoc(ctx, marketContext, strategy, state, sideLabel, targetPrice, orderQuantity, fundingSource, options = {}) {
+  const orderStrategy = {
+    ...strategy,
+    orderType: 'ioc',
+  };
+
+  ctx.logger.event('takerDecision', {
+    market: strategy.market,
+    side: sideLabel,
+    quantity: orderQuantity,
+    targetPrice,
+    fundingSource,
+    volumeMill: options.volumeMill === true,
+  });
+
+  const order = await submitStrategyOrder(
+    ctx,
+    marketContext,
+    orderStrategy,
+    sideLabel,
+    targetPrice,
+    orderQuantity,
+    { fundingSource }
+  );
+  if (!order.success) {
+    ctx.logger.event('makerSimulationRejected', {
+      market: marketContext.market.symbol,
+      side: sideLabel,
+      targetPrice,
+      quantity: orderQuantity,
+    });
+    return false;
+  }
+
+  state.lastTakerSide = sideLabel;
+  state.lastTakerPrice = targetPrice;
+  state.lastTakerAt = Date.now();
+  markPersistentStateDirty(ctx);
+
+  if (options.trackInventoryCost && sideLabel === 'bid') {
+    state.lastInventoryBuyPrice = targetPrice;
+    ctx.logger.event('inventoryCostUpdated', {
+      market: strategy.market,
+      lastInventoryBuyPrice: state.lastInventoryBuyPrice,
+    });
+  }
+
+  if (order.dryRun) {
+    ctx.logger.event('makerDryRunPlace', {
+      market: marketContext.market.symbol,
+      side: sideLabel,
+      targetPrice,
+      quantity: orderQuantity,
+    });
+    return true;
+  }
+
+  ctx.logger.event('takerOrderPlaced', {
+    market: marketContext.market.symbol,
+    side: sideLabel,
+    targetPrice,
+    quantity: orderQuantity,
+    fundingSource,
+    orderId: order.orderId,
+    txHash: order.tx.txResponse.hash,
+    gasUsed: order.tx.receipt.gasUsed,
+  });
+  return true;
+}
+
 function computeMinimumSellPrice(entryPrice, minRoundTripBps, tickSize) {
   const basePrice = entryPrice || 0n;
   const markup = minRoundTripBps > 0n
@@ -1754,7 +1948,217 @@ async function runMakerSpreadStrategy(ctx, strategy, state) {
   }
 }
 
+async function runVolumeMillTakerStrategy(ctx, strategy, state) {
+  const marketContext = await getMarketContext(ctx, strategy.market);
+  ctx.currentStrategyDryRun = strategy.dryRun ?? ctx.dryRun;
+  const bookDepth = Number(strategy.bookDepthLevels || 5);
+  const top = await getTopOfBook(marketContext, bookDepth);
+
+  if (top.bestBid === 0n || top.bestAsk === 0n) {
+    ctx.logger.event('volumeMillSkippedNoLiquidity', { market: strategy.market });
+    return;
+  }
+
+  const midpoint = getMidpoint(top.bestBid, top.bestAsk);
+  const spreadBps = computeBps(top.bestAsk - top.bestBid, midpoint);
+  const maxSpreadBps = strategy.maxSpreadBps !== undefined ? BigInt(strategy.maxSpreadBps) : 50n;
+  if (spreadBps > maxSpreadBps) {
+    ctx.logger.event('volumeMillSkippedWideSpread', {
+      market: strategy.market,
+      spreadBps,
+      maxSpreadBps,
+    });
+    return;
+  }
+
+  const minSideDepthUsd = strategy.minSideDepthUsd || '2.50';
+  const minSideDepthQuote = parseUsdToQuoteWei(minSideDepthUsd, marketContext.quoteDecimals, 'minSideDepthUsd');
+  const [bidDepthQuote, askDepthQuote] = await Promise.all([
+    sumSideDepthQuote(marketContext.poolRead, top.bids || []),
+    sumSideDepthQuote(marketContext.poolRead, top.asks || []),
+  ]);
+  if (bidDepthQuote < minSideDepthQuote) {
+    ctx.logger.event('volumeMillSkippedThinBidDepth', {
+      market: strategy.market,
+      bidDepthQuote,
+      minSideDepthQuote,
+    });
+    return;
+  }
+  if (askDepthQuote < minSideDepthQuote) {
+    ctx.logger.event('volumeMillSkippedThinAskDepth', {
+      market: strategy.market,
+      askDepthQuote,
+      minSideDepthQuote,
+    });
+    return;
+  }
+
+  const existingOrders = await getOwnOpenOrdersDetailed(marketContext);
+  if (existingOrders.length > 0) {
+    if (strategy.dryRun ?? ctx.dryRun) {
+      ctx.logger.event('makerExtraOrdersDetected', {
+        market: strategy.market,
+        side: 'both',
+        orderIds: existingOrders.map((order) => order.orderId),
+      });
+    } else {
+      await cancelAllOwnOrders(ctx, marketContext, 'volume-mill-reset');
+    }
+  }
+
+  const walletBalances = await getWalletBalances(ctx, marketContext);
+  const tradableBase = getTradableWalletBase(strategy, marketContext, walletBalances);
+  const freeQuote = walletBalances.quoteWallet;
+  const crossBps = BigInt(strategy.iocCrossBps ?? strategy.crossBps ?? 5);
+  const depthUsageFractionBps = parseDepthUsageFractionBps(strategy.depthUsageFraction);
+  const buyPrice = computeIocCrossPrice('bid', top.bestBid, top.bestAsk, marketContext.tickSize, crossBps);
+  const sellPrice = computeIocCrossPrice('ask', top.bestBid, top.bestAsk, marketContext.tickSize, crossBps);
+
+  ctx.logger.event('takerBookSnapshot', {
+    market: strategy.market,
+    bestBid: top.bestBid,
+    bestAsk: top.bestAsk,
+    spreadBps,
+    volumeMill: true,
+  });
+
+  const maxInventoryUsd = strategy.maxInventoryImbalanceUsd || '3.00';
+  const maxInventoryQuote = parseUsdToQuoteWei(maxInventoryUsd, marketContext.quoteDecimals, 'maxInventoryImbalanceUsd');
+  const maxInventoryBase = await estimateBaseQuantityForQuoteBudget(
+    marketContext.poolRead,
+    maxInventoryQuote,
+    top.bestBid,
+    marketContext.lotSize,
+    marketContext.minQuantity
+  );
+
+  async function trySell(quantity, reason) {
+    if (quantity < marketContext.minQuantity || quantity <= 0n) {
+      ctx.logger.event('volumeMillSkippedSellTooSmall', {
+        market: strategy.market,
+        quantity,
+        minQuantity: marketContext.minQuantity,
+        reason,
+      });
+      return false;
+    }
+    const cappedQty = await capQuantityToDepth(
+      marketContext.poolRead,
+      quantity,
+      top.bestBid,
+      bidDepthQuote,
+      depthUsageFractionBps,
+      marketContext.lotSize,
+      marketContext.minQuantity
+    );
+    if (cappedQty < marketContext.minQuantity) {
+      ctx.logger.event('volumeMillSkippedSellTooSmall', {
+        market: strategy.market,
+        quantity: cappedQty,
+        minQuantity: marketContext.minQuantity,
+        reason: `${reason}:depth_cap`,
+      });
+      return false;
+    }
+    return placeTakerVolumeIoc(ctx, marketContext, strategy, state, 'ask', sellPrice, cappedQty, 'wallet', {
+      volumeMill: true,
+    });
+  }
+
+  if (maxInventoryBase > 0n && tradableBase > maxInventoryBase) {
+    await trySell(tradableBase, 'inventory_cap');
+    return;
+  }
+
+  const sizePerCycleUsd = resolveSizePerCycleUsd(strategy);
+  const sizePerCycleQuote = parseUsdToQuoteWei(sizePerCycleUsd, marketContext.quoteDecimals, 'sizePerCycleUsd');
+  const minBuyQuote = await marketContext.poolRead.convertToQuoteAtPriceCeil(marketContext.minQuantity, top.bestAsk);
+
+  if (state.lastTakerSide === 'ask' && tradableBase > 0n) {
+    await trySell(tradableBase, 'retry_after_sell');
+    return;
+  }
+
+  if (tradableBase > 0n && freeQuote < minBuyQuote) {
+    await trySell(tradableBase, 'low_quote_flatten');
+    return;
+  }
+
+  if (state.lastTakerSide === 'bid' && tradableBase > 0n) {
+    await trySell(tradableBase, 'ping_pong_sell');
+    return;
+  }
+
+  const usableAskDepthQuote = (askDepthQuote * depthUsageFractionBps) / 10_000n;
+  const quoteBudget = [sizePerCycleQuote, (freeQuote * 95n) / 100n, usableAskDepthQuote].reduce((min, value) =>
+    value < min ? value : min
+  );
+  if (quoteBudget <= 0n) {
+    ctx.logger.event('volumeMillSkippedBuyBudgetZero', {
+      market: strategy.market,
+      sizePerCycleQuote,
+      freeQuote,
+      usableAskDepthQuote,
+    });
+    return;
+  }
+
+  let buyQuantity = await estimateBaseQuantityForQuoteBudget(
+    marketContext.poolRead,
+    quoteBudget,
+    buyPrice,
+    marketContext.lotSize,
+    marketContext.minQuantity
+  );
+  buyQuantity = await capQuantityToDepth(
+    marketContext.poolRead,
+    buyQuantity,
+    buyPrice,
+    askDepthQuote,
+    depthUsageFractionBps,
+    marketContext.lotSize,
+    marketContext.minQuantity
+  );
+  if (buyQuantity < marketContext.minQuantity) {
+    if (tradableBase > 0n) {
+      await trySell(tradableBase, 'buy_qty_too_small');
+      return;
+    }
+    ctx.logger.event('volumeMillSkippedBuyTooSmall', {
+      market: strategy.market,
+      quoteBudget,
+      minQuantity: marketContext.minQuantity,
+    });
+    return;
+  }
+
+  const requiredQuote = await marketContext.poolRead.convertToQuoteAtPriceCeil(buyQuantity, buyPrice);
+  if (freeQuote < requiredQuote) {
+    if (tradableBase > 0n) {
+      await trySell(tradableBase, 'insufficient_quote');
+      return;
+    }
+    ctx.logger.event('makerSkippedBidInsufficientQuote', {
+      market: strategy.market,
+      requiredQuote,
+      quoteWallet: walletBalances.quoteWallet,
+      quoteVault: 0n,
+    });
+    return;
+  }
+
+  await placeTakerVolumeIoc(ctx, marketContext, strategy, state, 'bid', buyPrice, buyQuantity, 'wallet', {
+    volumeMill: true,
+  });
+}
+
 async function runTakerVolumeStrategy(ctx, strategy, state) {
+  if (strategy.volumeMill === true) {
+    await runVolumeMillTakerStrategy(ctx, strategy, state);
+    return;
+  }
+
   const marketContext = await getMarketContext(ctx, strategy.market);
   ctx.currentStrategyDryRun = strategy.dryRun ?? ctx.dryRun;
   const top = await getTopOfBook(marketContext, 3);
@@ -1819,6 +2223,10 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
 
   const crossTicks = BigInt(strategy.crossTicks || 0);
   const minRoundTripBps = BigInt(strategy.minRoundTripBps || 0);
+  const staleCostBasisResetBps =
+    strategy.staleCostBasisResetBps !== undefined && strategy.staleCostBasisResetBps !== null
+      ? BigInt(strategy.staleCostBasisResetBps)
+      : null;
   const buyPrice = computeIocTargetPrice('bid', top.bestBid, top.bestAsk, marketContext.tickSize, crossTicks);
   const sellPrice = computeIocTargetPrice('ask', top.bestBid, top.bestAsk, marketContext.tickSize, crossTicks);
   const requiredQuote = await marketContext.poolRead.convertToQuoteAtPriceCeil(quantity, buyPrice);
@@ -1835,13 +2243,62 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
     askFunding.availableQuantity < marketContext.minQuantity;
   if (askFunding) {
     if (minimumSellPrice !== null && sellPrice < minimumSellPrice) {
-      ctx.logger.event('takerSkippedBelowCost', {
-        market: strategy.market,
-        sellPrice,
-        minimumSellPrice,
-        lastInventoryBuyPrice: state.lastInventoryBuyPrice,
-      });
-      return;
+      if (staleCostBasisResetBps !== null && staleCostBasisResetBps > 0n) {
+        const diffBps = computeBps(minimumSellPrice - sellPrice, minimumSellPrice);
+        if (diffBps >= staleCostBasisResetBps) {
+          const oldLastBuy = state.lastInventoryBuyPrice;
+          // Approximate a new entry price so that the minimum sell comes back down near `sellPrice`.
+          // We align down so the subsequent `alignToTick(...,'up')` can't push the minimum above `sellPrice`.
+          const approxNewEntry =
+            minRoundTripBps > 0n
+              ? (sellPrice * 10_000n) / (10_000n + minRoundTripBps)
+              : sellPrice;
+          const newLastBuy = alignToTick(approxNewEntry, marketContext.tickSize, 'down');
+          const newMinimumSell = computeMinimumSellPrice(newLastBuy, minRoundTripBps, marketContext.tickSize);
+
+          if (newMinimumSell <= sellPrice) {
+            state.lastInventoryBuyPrice = newLastBuy;
+            markPersistentStateDirty(ctx);
+            ctx.logger.event('inventoryCostStaleReset', {
+              market: strategy.market,
+              oldLastBuy,
+              newLastBuy,
+              diffBps,
+              sellPrice,
+              previousMinimumSellPrice: minimumSellPrice,
+              newMinimumSellPrice: newMinimumSell,
+            });
+          } else {
+            return;
+          }
+        } else {
+          return;
+        }
+      } else {
+        return;
+      }
+      // Re-check after a possible reset; if still below the floor, do nothing.
+      if (
+        state.lastInventoryBuyPrice !== null &&
+        computeMinimumSellPrice(state.lastInventoryBuyPrice, minRoundTripBps, marketContext.tickSize) > sellPrice
+      ) {
+        return;
+      }
+
+      const effectiveMinimumSellPrice =
+        state.lastInventoryBuyPrice !== null
+          ? computeMinimumSellPrice(state.lastInventoryBuyPrice, minRoundTripBps, marketContext.tickSize)
+          : null;
+
+      if (effectiveMinimumSellPrice !== null && sellPrice < effectiveMinimumSellPrice) {
+        ctx.logger.event('takerSkippedBelowCost', {
+          market: strategy.market,
+          sellPrice,
+          minimumSellPrice: effectiveMinimumSellPrice,
+          lastInventoryBuyPrice: state.lastInventoryBuyPrice,
+        });
+        return;
+      }
     }
     if (!hasAskDustInventory) {
       sideLabel = 'ask';
@@ -1892,70 +2349,17 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
   }
 
   const targetPrice = sideLabel === 'bid' ? buyPrice : sellPrice;
-  const orderStrategy = {
-    ...strategy,
-    orderType: 'ioc',
-  };
-
-  ctx.logger.event('takerDecision', {
-    market: strategy.market,
-    side: sideLabel,
-    quantity: orderQuantity,
-    targetPrice,
-    fundingSource: funding.fundingSource,
-  });
-
-  const order = await submitStrategyOrder(
+  await placeTakerVolumeIoc(
     ctx,
     marketContext,
-    orderStrategy,
+    strategy,
+    state,
     sideLabel,
     targetPrice,
     orderQuantity,
-    { fundingSource: funding.fundingSource }
+    funding.fundingSource,
+    { trackInventoryCost: true }
   );
-  if (!order.success) {
-    ctx.logger.event('makerSimulationRejected', {
-      market: marketContext.market.symbol,
-      side: sideLabel,
-      targetPrice,
-      quantity: orderQuantity,
-    });
-    return;
-  }
-
-  state.lastTakerSide = sideLabel;
-  state.lastTakerPrice = targetPrice;
-  state.lastTakerAt = Date.now();
-  markPersistentStateDirty(ctx);
-  if (sideLabel === 'bid') {
-    state.lastInventoryBuyPrice = targetPrice;
-    ctx.logger.event('inventoryCostUpdated', {
-      market: strategy.market,
-      lastInventoryBuyPrice: state.lastInventoryBuyPrice,
-    });
-  }
-
-  if (order.dryRun) {
-    ctx.logger.event('makerDryRunPlace', {
-      market: marketContext.market.symbol,
-      side: sideLabel,
-      targetPrice,
-      quantity: orderQuantity,
-    });
-    return;
-  }
-
-  ctx.logger.event('takerOrderPlaced', {
-    market: marketContext.market.symbol,
-    side: sideLabel,
-    targetPrice,
-    quantity: orderQuantity,
-    fundingSource: funding.fundingSource,
-    orderId: order.orderId,
-    txHash: order.tx.txResponse.hash,
-    gasUsed: order.tx.receipt.gasUsed,
-  });
 }
 
 function buildStopTriggerPrice(markPrice, strategy, isBid) {

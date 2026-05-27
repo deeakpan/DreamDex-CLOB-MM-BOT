@@ -11,6 +11,8 @@
     "dreamdex:bot:mainnet:once": "node scripts/dreamdex-bot.js --config config/dreamdex.bot.mainnet.json --once",
     "dreamdex:state:push": "node scripts/dreamdex-sync-state.js --config config/dreamdex.bot.settings.json",
     "dreamdex:state:push:mainnet": "node scripts/dreamdex-sync-state.js --config config/dreamdex.bot.mainnet.json",
+    "dreamdex:state:clear:mainnet": "node scripts/dreamdex-clear-state.js --config config/dreamdex.bot.mainnet.json",
+    "dreamdex:reconcile:mainnet": "node scripts/dreamdex-reconcile-to-quote.js --config config/dreamdex.bot.mainnet.json",
     "dreamdex:run": "node scripts/dreamdex-runner.js --config config/dreamdex.settings.json",
     "dreamdex:run:mainnet": "node scripts/dreamdex-runner.js --config config/dreamdex.settings.json --network mainnet",
     "dreamdex:run:testnet": "node scripts/dreamdex-runner.js --config config/dreamdex.settings.json --network testnet",

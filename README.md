@@ -430,6 +430,8 @@ For current `takerVolume` markets:
   Maximum spread tolerated before skipping.
 - `minRoundTripBps`
   Minimum margin above stored cost basis before selling inventory.
+- `staleCostBasisResetBps` (optional)
+  If set, and the bot sees current sell-now price far below the stored cost-basis floor (by at least this many bps), it will do a one-time “cost basis stale reset” so WETH/WBTC can exit instead of being stuck holding forever.
 - `placeBid`
   Allow buy-side behavior.
 - `placeAsk`
