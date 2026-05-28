@@ -1556,14 +1556,15 @@ async function estimateBaseQuantityForQuoteBudget(poolRead, quoteBudget, price, 
 function getTradableWalletBase(strategy, marketContext, walletBalances) {
   let base = walletBalances.baseWallet;
   if (!marketContext.market.isNativeBase) {
-    return base;
+    return alignToLot(base, marketContext.lotSize, 'down');
   }
   const reserve = resolveNativeBaseReserve(strategy, marketContext);
   if (reserve <= 0n) {
-    return base;
+    return alignToLot(base, marketContext.lotSize, 'down');
   }
   const reserved = base > reserve ? reserve : base;
-  return base > reserved ? base - reserved : 0n;
+  base = base > reserved ? base - reserved : 0n;
+  return alignToLot(base, marketContext.lotSize, 'down');
 }
 
 async function capQuantityToDepth(poolRead, quantity, price, sideDepthQuote, depthUsageFractionBps, lotSize, minQuantity) {
@@ -2034,6 +2035,7 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
   );
 
   async function trySell(quantity, reason) {
+    quantity = alignToLot(quantity, marketContext.lotSize, 'down');
     if (quantity < marketContext.minQuantity || quantity <= 0n) {
       ctx.logger.event('volumeMillSkippedSellTooSmall', {
         market: strategy.market,
