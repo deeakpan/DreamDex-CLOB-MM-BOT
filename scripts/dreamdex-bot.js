@@ -1549,14 +1549,29 @@ async function estimateBaseQuantityForQuoteBudget(poolRead, quoteBudget, price, 
   }
 
   const step = lotSize > 0n ? lotSize : minQuantity;
-  let quantity = alignToLot(minQuantity, lotSize, 'down');
+  const wad = 1_000_000_000_000_000_000n;
+
+  // Pool converts with raw units: quote ≈ baseQty * price / WAD. Do not walk up
+  // from minQuantity in 0.01 steps — 256 steps caps near 3.55 SOMI when min is 1 SOMI.
+  let quantity = alignToLot((quoteBudget * wad) / price, lotSize, 'down');
   if (quantity < minQuantity) {
-    quantity = minQuantity;
+    quantity = alignToLot(minQuantity, lotSize, 'down');
+  }
+
+  while (quantity >= minQuantity) {
+    const quoteNeeded = await poolRead.convertToQuoteAtPriceCeil(quantity, price);
+    if (quoteNeeded <= quoteBudget) {
+      break;
+    }
+    if (quantity <= step) {
+      return 0n;
+    }
+    quantity -= step;
   }
 
   let best = 0n;
   let guard = 0;
-  while (guard < 256) {
+  while (quantity >= minQuantity && guard < 2048) {
     guard += 1;
     const quoteNeeded = await poolRead.convertToQuoteAtPriceCeil(quantity, price);
     if (quoteNeeded > quoteBudget) {
