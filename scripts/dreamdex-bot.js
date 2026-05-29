@@ -279,6 +279,16 @@ function formatConsoleEvent(type, payload, filePath) {
       return `IOC side ${payload.market}: ${payload.side}`;
     case 'takerOrderPlaced':
       return `IOC sent ${payload.market} ${payload.side}: price=${payload.targetPrice} qty=${payload.quantity}`;
+    case 'makerSimulationRejected':
+      return `IOC skipped ${payload.market} ${payload.side}: simulation rejected (no tx)`;
+    case 'volumeMillSkippedBuyBudgetZero':
+      return `IOC skipped ${payload.market}: buy budget zero`;
+    case 'volumeMillSkippedBuyTooSmall':
+      return `IOC skipped ${payload.market}: buy size below minimum`;
+    case 'volumeMillSkippedSellTooSmall':
+      return `IOC skipped ${payload.market}: sell size below minimum`;
+    case 'volumeMillSizing':
+      return `Volume mill size ${payload.market} ${payload.side}: targetUsd=${payload.sizePerCycleUsd} budgetUsd=${payload.quoteBudgetUsd} qty=${payload.quantity} tradableBase=${payload.tradableBase ?? 'n/a'}`;
     case 'takerSkippedWideSpread':
     case 'volumeMillSkippedWideSpread':
       return `IOC skipped ${payload.market}: spreadBps=${payload.spreadBps} max=${payload.maxSpreadBps}`;
@@ -1060,15 +1070,21 @@ async function maybeAutoFundVault(ctx, marketContext, strategy, balances, wallet
   return updated;
 }
 
+async function getRpcBookLevels(marketContext, depth) {
+  const levelCount = BigInt(Math.max(1, depth));
+  const [bids, asks] = await Promise.all([
+    marketContext.poolRead.getBookLevels(true, levelCount),
+    marketContext.poolRead.getBookLevels(false, levelCount),
+  ]);
+  return { bids, asks };
+}
+
 async function getTopOfBook(marketContext, depth = 1) {
   const wsBook = marketContext.ctx.marketFeed ? marketContext.ctx.marketFeed.getTopOfBook(marketContext.market.symbol, depth) : null;
   if (wsBook) {
     return wsBook;
   }
-  const [bids, asks] = await Promise.all([
-    marketContext.poolRead.getBookLevels(true, depth),
-    marketContext.poolRead.getBookLevels(false, depth),
-  ]);
+  const { bids, asks } = await getRpcBookLevels(marketContext, depth);
   return {
     bids,
     asks,
@@ -1974,9 +1990,10 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
 
   const minSideDepthUsd = strategy.minSideDepthUsd || '2.50';
   const minSideDepthQuote = parseUsdToQuoteWei(minSideDepthUsd, marketContext.quoteDecimals, 'minSideDepthUsd');
+  const rpcBook = await getRpcBookLevels(marketContext, bookDepth);
   const [bidDepthQuote, askDepthQuote] = await Promise.all([
-    sumSideDepthQuote(marketContext.poolRead, top.bids || []),
-    sumSideDepthQuote(marketContext.poolRead, top.asks || []),
+    sumSideDepthQuote(marketContext.poolRead, rpcBook.bids),
+    sumSideDepthQuote(marketContext.poolRead, rpcBook.asks),
   ]);
   if (bidDepthQuote < minSideDepthQuote) {
     ctx.logger.event('volumeMillSkippedThinBidDepth', {
@@ -2034,7 +2051,25 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
     marketContext.minQuantity
   );
 
-  async function trySell(quantity, reason) {
+  const sizePerCycleUsd = resolveSizePerCycleUsd(strategy);
+  const sizePerCycleQuote = parseUsdToQuoteWei(sizePerCycleUsd, marketContext.quoteDecimals, 'sizePerCycleUsd');
+
+  async function sellQuantityForCycle(tradableBaseAmount) {
+    const targetBase = await estimateBaseQuantityForQuoteBudget(
+      marketContext.poolRead,
+      sizePerCycleQuote,
+      sellPrice,
+      marketContext.lotSize,
+      marketContext.minQuantity
+    );
+    if (targetBase <= 0n) {
+      return 0n;
+    }
+    const quantity = tradableBaseAmount < targetBase ? tradableBaseAmount : targetBase;
+    return alignToLot(quantity, marketContext.lotSize, 'down');
+  }
+
+  async function trySell(quantity, reason, sizingMeta = {}) {
     quantity = alignToLot(quantity, marketContext.lotSize, 'down');
     if (quantity < marketContext.minQuantity || quantity <= 0n) {
       ctx.logger.event('volumeMillSkippedSellTooSmall', {
@@ -2063,37 +2098,47 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
       });
       return false;
     }
+    ctx.logger.event('volumeMillSizing', {
+      market: strategy.market,
+      side: 'ask',
+      reason,
+      sizePerCycleUsd,
+      quoteBudgetUsd: sizingMeta.quoteBudgetUsd ?? null,
+      tradableBase: sizingMeta.tradableBase ?? null,
+      quantity: cappedQty,
+      bookSource: top.source,
+    });
     return placeTakerVolumeIoc(ctx, marketContext, strategy, state, 'ask', sellPrice, cappedQty, 'wallet', {
       volumeMill: true,
     });
   }
 
   if (maxInventoryBase > 0n && tradableBase > maxInventoryBase) {
-    await trySell(tradableBase, 'inventory_cap');
+    await trySell(tradableBase, 'inventory_cap', { tradableBase });
     return;
   }
 
-  const sizePerCycleUsd = resolveSizePerCycleUsd(strategy);
-  const sizePerCycleQuote = parseUsdToQuoteWei(sizePerCycleUsd, marketContext.quoteDecimals, 'sizePerCycleUsd');
   const minBuyQuote = await marketContext.poolRead.convertToQuoteAtPriceCeil(marketContext.minQuantity, top.bestAsk);
 
   if (state.lastTakerSide === 'ask' && tradableBase > 0n) {
-    await trySell(tradableBase, 'retry_after_sell');
+    const sellQty = await sellQuantityForCycle(tradableBase);
+    await trySell(sellQty, 'retry_after_sell', { tradableBase });
     return;
   }
 
   if (tradableBase > 0n && freeQuote < minBuyQuote) {
-    await trySell(tradableBase, 'low_quote_flatten');
+    const sellQty = await sellQuantityForCycle(tradableBase);
+    await trySell(sellQty, 'low_quote_flatten', { tradableBase });
     return;
   }
 
   if (state.lastTakerSide === 'bid' && tradableBase > 0n) {
-    await trySell(tradableBase, 'ping_pong_sell');
+    const sellQty = await sellQuantityForCycle(tradableBase);
+    await trySell(sellQty, 'ping_pong_sell', { tradableBase });
     return;
   }
 
-  const usableAskDepthQuote = (askDepthQuote * depthUsageFractionBps) / 10_000n;
-  const quoteBudget = [sizePerCycleQuote, (freeQuote * 95n) / 100n, usableAskDepthQuote].reduce((min, value) =>
+  const quoteBudget = [sizePerCycleQuote, (freeQuote * 95n) / 100n].reduce((min, value) =>
     value < min ? value : min
   );
   if (quoteBudget <= 0n) {
@@ -2124,7 +2169,8 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
   );
   if (buyQuantity < marketContext.minQuantity) {
     if (tradableBase > 0n) {
-      await trySell(tradableBase, 'buy_qty_too_small');
+      const sellQty = await sellQuantityForCycle(tradableBase);
+      await trySell(sellQty, 'buy_qty_too_small', { tradableBase });
       return;
     }
     ctx.logger.event('volumeMillSkippedBuyTooSmall', {
@@ -2138,7 +2184,8 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
   const requiredQuote = await marketContext.poolRead.convertToQuoteAtPriceCeil(buyQuantity, buyPrice);
   if (freeQuote < requiredQuote) {
     if (tradableBase > 0n) {
-      await trySell(tradableBase, 'insufficient_quote');
+      const sellQty = await sellQuantityForCycle(tradableBase);
+      await trySell(sellQty, 'insufficient_quote', { tradableBase });
       return;
     }
     ctx.logger.event('makerSkippedBidInsufficientQuote', {
@@ -2149,6 +2196,18 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
     });
     return;
   }
+
+  ctx.logger.event('volumeMillSizing', {
+    market: strategy.market,
+    side: 'bid',
+    reason: 'ping_pong_buy',
+    sizePerCycleUsd,
+    quoteBudgetUsd: ethers.formatUnits(quoteBudget, marketContext.quoteDecimals),
+    freeQuoteUsd: ethers.formatUnits(freeQuote, marketContext.quoteDecimals),
+    askDepthUsd: ethers.formatUnits(askDepthQuote, marketContext.quoteDecimals),
+    quantity: buyQuantity,
+    bookSource: top.source,
+  });
 
   await placeTakerVolumeIoc(ctx, marketContext, strategy, state, 'bid', buyPrice, buyQuantity, 'wallet', {
     volumeMill: true,
