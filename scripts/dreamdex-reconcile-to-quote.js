@@ -134,6 +134,33 @@ async function createProvider(networkConfig) {
   throw lastError || new Error('No RPC available');
 }
 
+async function getVerifiedNativeBalance(networkConfig, owner) {
+  const urls = networkConfig.rpcUrls || [networkConfig.rpcUrl];
+  const reads = [];
+  let best = 0n;
+  let bestUrl = null;
+
+  for (const url of urls) {
+    try {
+      const provider = new ethers.JsonRpcProvider(url, networkConfig.chainId, { staticNetwork: true });
+      const balance = await provider.getBalance(owner);
+      reads.push({ url, balance: balance.toString() });
+      if (balance > best) {
+        best = balance;
+        bestUrl = url;
+      }
+    } catch (error) {
+      reads.push({ url, error: error.message || String(error) });
+    }
+  }
+
+  if (bestUrl === null) {
+    throw new Error('No RPC could read native balance');
+  }
+
+  return { balance: best, rpcUrl: bestUrl, reads };
+}
+
 async function getMarketContext(provider, signer, networkName, symbol) {
   const market = DEFAULT_MARKETS[networkName][symbol];
   if (!market) throw new Error(`Unknown market: ${symbol}`);
@@ -318,7 +345,7 @@ async function sellWalletBase(ctx, { quantity, price, dryRun }) {
 }
 
 async function reconcileMarket(mc, signer, options) {
-  const { symbol, somiReserveWei, dryRun, skipSell, crossBps } = options;
+  const { symbol, somiReserveWei, dryRun, skipSell, crossBps, networkConfig } = options;
   console.log(`\n${symbol}`);
   const owner = await signer.getAddress();
 
@@ -343,16 +370,31 @@ async function reconcileMarket(mc, signer, options) {
   }
 
   const sellPrice = sellCrossPrice(top.bestBid, mc.tickSize, crossBps);
-  const [nativeBalance, erc20Wallet] = await Promise.all([
-    mc.market.isNativeBase ? signer.provider.getBalance(owner) : 0n,
-    mc.market.isNativeBase ? 0n : mc.baseTokenContract.balanceOf(owner),
-  ]);
+  let nativeBalance = 0n;
+  let nativeBalanceReads = null;
+  if (mc.market.isNativeBase) {
+    const verified = await getVerifiedNativeBalance(networkConfig, owner);
+    nativeBalance = verified.balance;
+    nativeBalanceReads = verified.reads;
+  }
+  const erc20Wallet = mc.market.isNativeBase ? 0n : await mc.baseTokenContract.balanceOf(owner);
 
   let walletQty = mc.market.isNativeBase ? nativeBalance : erc20Wallet;
+  const walletQtyBeforeReserve = walletQty;
   if (mc.market.isNativeBase && symbol === 'SOMI:USDso') {
     walletQty = walletQty > somiReserveWei ? walletQty - somiReserveWei : 0n;
   }
+  const walletQtyBeforeLot = walletQty;
   walletQty = alignToLot(walletQty, mc.lotSize);
+
+  if (mc.market.isNativeBase) {
+    console.log(
+      `  native=${fmt(walletQtyBeforeReserve, mc.baseDecimals, mc.baseSymbol)} reserve=${fmt(somiReserveWei, mc.baseDecimals, mc.baseSymbol)} sellable=${fmt(walletQtyBeforeLot, mc.baseDecimals, mc.baseSymbol)} aligned=${fmt(walletQty, mc.baseDecimals, mc.baseSymbol)} min=${fmt(mc.minQuantity, mc.baseDecimals, mc.baseSymbol)}`
+    );
+    if (nativeBalanceReads) {
+      console.log(`  balance reads: ${JSON.stringify(nativeBalanceReads)}`);
+    }
+  }
 
   if (walletQty >= mc.minQuantity) {
     await sellWalletBase(
@@ -416,6 +458,7 @@ async function main() {
       dryRun: cli.dryRun,
       skipSell: cli.skipSell,
       crossBps: cli.crossBps,
+      networkConfig,
     });
   }
 
