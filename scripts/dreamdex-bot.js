@@ -286,7 +286,11 @@ function formatConsoleEvent(type, payload, filePath) {
     case 'volumeMillSkippedBuyTooSmall':
       return `IOC skipped ${payload.market}: buy size below minimum`;
     case 'volumeMillSkippedSellTooSmall':
-      return `IOC skipped ${payload.market}: sell size below minimum`;
+      return `IOC skipped ${payload.market}: sell size below minimum (have ${payload.quantity}, need ${payload.minQuantity})`;
+    case 'volumeMillPingPongReset':
+      return `Ping-pong reset ${payload.market}: ${payload.reason} tradableBase=${payload.tradableBase}`;
+    case 'volumeMillStuck':
+      return `BOT STUCK ${payload.market}: ${payload.reason} USDso=${payload.freeQuoteUsd} tradableSOMI=${payload.tradableBase}`;
     case 'volumeMillSizing':
       return `Volume mill size ${payload.market} ${payload.side}: targetUsd=${payload.sizePerCycleUsd} budgetUsd=${payload.quoteBudgetUsd} qty=${payload.quantity} tradableBase=${payload.tradableBase ?? 'n/a'}`;
     case 'takerSkippedWideSpread':
@@ -2128,41 +2132,94 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
     });
   }
 
+  async function resetPingPongIfSellBlocked(reason) {
+    if (state.lastTakerSide !== 'bid' && state.lastTakerSide !== 'ask') {
+      return;
+    }
+    state.lastTakerSide = null;
+    markPersistentStateDirty(ctx);
+    ctx.logger.event('volumeMillPingPongReset', {
+      market: strategy.market,
+      reason,
+      tradableBase,
+      freeQuote,
+      minQuantity: marketContext.minQuantity,
+    });
+  }
+
+  async function trySellCycle(reason) {
+    if (tradableBase < marketContext.minQuantity) {
+      ctx.logger.event('volumeMillSkippedSellTooSmall', {
+        market: strategy.market,
+        quantity: tradableBase,
+        minQuantity: marketContext.minQuantity,
+        reason,
+      });
+      return false;
+    }
+    const sellQty = await sellQuantityForCycle(tradableBase);
+    return trySell(sellQty, reason, { tradableBase });
+  }
+
+  function logStuckIfIdle(reason) {
+    ctx.logger.event('volumeMillStuck', {
+      market: strategy.market,
+      reason,
+      freeQuoteUsd: ethers.formatUnits(freeQuote, marketContext.quoteDecimals),
+      tradableBase: ethers.formatUnits(tradableBase, marketContext.baseDecimals),
+      lastTakerSide: state.lastTakerSide,
+      nativeWallet: ethers.formatUnits(walletBalances.baseWallet, marketContext.baseDecimals),
+    });
+  }
+
   if (maxInventoryBase > 0n && tradableBase > maxInventoryBase) {
-    await trySell(tradableBase, 'inventory_cap', { tradableBase });
-    return;
+    if (await trySellCycle('inventory_cap')) {
+      return;
+    }
+    await resetPingPongIfSellBlocked('inventory_cap_failed');
   }
 
   const minBuyQuote = await marketContext.poolRead.convertToQuoteAtPriceCeil(marketContext.minQuantity, top.bestAsk);
 
   if (state.lastTakerSide === 'ask' && tradableBase > 0n) {
-    const sellQty = await sellQuantityForCycle(tradableBase);
-    await trySell(sellQty, 'retry_after_sell', { tradableBase });
-    return;
+    if (await trySellCycle('retry_after_sell')) {
+      return;
+    }
+    await resetPingPongIfSellBlocked('retry_after_sell_failed');
   }
 
   if (tradableBase > 0n && freeQuote < minBuyQuote) {
-    const sellQty = await sellQuantityForCycle(tradableBase);
-    await trySell(sellQty, 'low_quote_flatten', { tradableBase });
+    if (await trySellCycle('low_quote_flatten')) {
+      return;
+    }
+    logStuckIfIdle('no_usdso_and_sell_below_min_qty');
     return;
   }
 
-  if (state.lastTakerSide === 'bid' && tradableBase > 0n) {
-    const sellQty = await sellQuantityForCycle(tradableBase);
-    await trySell(sellQty, 'ping_pong_sell', { tradableBase });
-    return;
+  if (state.lastTakerSide === 'bid') {
+    if (tradableBase >= marketContext.minQuantity) {
+      if (await trySellCycle('ping_pong_sell')) {
+        return;
+      }
+      await resetPingPongIfSellBlocked('ping_pong_sell_failed');
+    } else if (tradableBase > 0n) {
+      await resetPingPongIfSellBlocked('dust_below_min_qty');
+    }
   }
 
-  const quoteBudget = [sizePerCycleQuote, (freeQuote * 95n) / 100n].reduce((min, value) =>
+  const quoteUsageFractionBps = parseDepthUsageFractionBps(strategy.quoteUsageFraction ?? 0.95);
+  const quoteBudget = [sizePerCycleQuote, (freeQuote * quoteUsageFractionBps) / 10_000n].reduce((min, value) =>
     value < min ? value : min
   );
-  if (quoteBudget <= 0n) {
+  if (quoteBudget <= 0n || freeQuote < minBuyQuote) {
     ctx.logger.event('volumeMillSkippedBuyBudgetZero', {
       market: strategy.market,
       sizePerCycleQuote,
       freeQuote,
+      minBuyQuote,
       usableAskDepthQuote,
     });
+    logStuckIfIdle('need_usdso_in_wallet');
     return;
   }
 
@@ -2183,9 +2240,7 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
     marketContext.minQuantity
   );
   if (buyQuantity < marketContext.minQuantity) {
-    if (tradableBase > 0n) {
-      const sellQty = await sellQuantityForCycle(tradableBase);
-      await trySell(sellQty, 'buy_qty_too_small', { tradableBase });
+    if (tradableBase >= marketContext.minQuantity && (await trySellCycle('buy_qty_too_small'))) {
       return;
     }
     ctx.logger.event('volumeMillSkippedBuyTooSmall', {
@@ -2198,9 +2253,7 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
 
   const requiredQuote = await marketContext.poolRead.convertToQuoteAtPriceCeil(buyQuantity, buyPrice);
   if (freeQuote < requiredQuote) {
-    if (tradableBase > 0n) {
-      const sellQty = await sellQuantityForCycle(tradableBase);
-      await trySell(sellQty, 'insufficient_quote', { tradableBase });
+    if (tradableBase >= marketContext.minQuantity && (await trySellCycle('insufficient_quote'))) {
       return;
     }
     ctx.logger.event('makerSkippedBidInsufficientQuote', {
@@ -2209,6 +2262,7 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
       quoteWallet: walletBalances.quoteWallet,
       quoteVault: 0n,
     });
+    logStuckIfIdle('insufficient_quote_for_buy');
     return;
   }
 
