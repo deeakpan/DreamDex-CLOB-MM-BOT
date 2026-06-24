@@ -49,7 +49,11 @@ const DEFAULT_NETWORKS = {
     label: 'mainnet',
     chainId: 5031,
     rpcUrl: 'https://api.infra.mainnet.somnia.network',
-    rpcUrls: ['https://api.infra.mainnet.somnia.network', 'https://somnia.publicnode.com'],
+    rpcUrls: [
+      'https://somnia-rpc.publicnode.com',
+      'https://api.infra.mainnet.somnia.network',
+      'https://somnia.publicnode.com',
+    ],
     restUrl: 'https://api.dreamdex.io',
     wsUrl: 'wss://api.dreamdex.io/v0/ws/public',
   },
@@ -187,15 +191,19 @@ function normalizePrivateKey(input) {
 }
 
 async function createProvider(networkConfig) {
-  const networkDetectionTimeoutMs = Number(networkConfig.networkDetectionTimeoutMs || 15000);
+  const networkDetectionTimeoutMs = Number(networkConfig.networkDetectionTimeoutMs || 30000);
+  const rpcTimeoutMs = Number(networkConfig.rpcTimeoutMs || networkDetectionTimeoutMs);
   const rpcUrls = Array.isArray(networkConfig.rpcUrls) && networkConfig.rpcUrls.length > 0
     ? networkConfig.rpcUrls
     : [networkConfig.rpcUrl];
+  const staticNetwork = ethers.Network.from(Number(networkConfig.chainId));
 
   const errors = [];
   for (const url of rpcUrls) {
-    const provider = new ethers.JsonRpcProvider(url);
     try {
+      const fetchRequest = new ethers.FetchRequest(url);
+      fetchRequest.timeout = rpcTimeoutMs;
+      const provider = new ethers.JsonRpcProvider(fetchRequest, staticNetwork, { staticNetwork });
       const network = await Promise.race([
         provider.getNetwork(),
         new Promise((_, reject) =>
@@ -995,6 +1003,83 @@ async function depositToVault(ctx, marketContext, token, amount, isNative, reaso
   });
 }
 
+function resolveVolumeMillFundingSource(strategy) {
+  return strategy.fundingSource === 'wallet' ? 'wallet' : 'vault';
+}
+
+async function ensureVolumeMillVaultFunding(
+  ctx,
+  marketContext,
+  strategy,
+  vaultBalances,
+  walletBalances,
+  sideLabel,
+  quantity,
+  targetPrice
+) {
+  const updated = { ...vaultBalances };
+  if (sideLabel === 'bid') {
+    const requiredQuote = await marketContext.poolRead.convertToQuoteAtPriceCeil(quantity, targetPrice);
+    if (updated.quoteVault >= requiredQuote) {
+      return updated;
+    }
+    const deficit = requiredQuote - updated.quoteVault;
+    const tradableQuote = getTradableWalletQuote(strategy, ctx.bot, marketContext, walletBalances.quoteWallet);
+    const depositAmount = deficit < tradableQuote ? deficit : tradableQuote;
+    if (depositAmount <= 0n) {
+      return null;
+    }
+    await ensureApproval(
+      ctx,
+      marketContext.quoteTokenContract,
+      marketContext.market.pool,
+      depositAmount,
+      `${marketContext.market.symbol}-volume-mill-quote`
+    );
+    await depositToVault(
+      ctx,
+      marketContext,
+      marketContext.quoteToken,
+      depositAmount,
+      false,
+      'volume-mill-bid-fund'
+    );
+    updated.quoteVault += depositAmount;
+    walletBalances.quoteWallet -= depositAmount;
+    return updated;
+  }
+
+  if (updated.baseVault >= quantity) {
+    return updated;
+  }
+  const deficit = quantity - updated.baseVault;
+  const tradableBase = getTradableWalletBase(strategy, marketContext, walletBalances);
+  const depositAmount = alignToLot(deficit < tradableBase ? deficit : tradableBase, marketContext.lotSize, 'down');
+  if (depositAmount <= 0n || updated.baseVault + depositAmount < quantity) {
+    return null;
+  }
+  if (!marketContext.market.isNativeBase) {
+    await ensureApproval(
+      ctx,
+      marketContext.baseTokenContract,
+      marketContext.market.pool,
+      depositAmount,
+      `${marketContext.market.symbol}-volume-mill-base`
+    );
+  }
+  await depositToVault(
+    ctx,
+    marketContext,
+    marketContext.baseToken,
+    depositAmount,
+    marketContext.market.isNativeBase,
+    'volume-mill-ask-fund'
+  );
+  updated.baseVault += depositAmount;
+  walletBalances.baseWallet -= depositAmount;
+  return updated;
+}
+
 async function maybeAutoFundVault(ctx, marketContext, strategy, balances, walletBalances) {
   if (!strategy.autoFund) {
     return balances;
@@ -1588,6 +1673,28 @@ async function estimateBaseQuantityForQuoteBudget(poolRead, quoteBudget, price, 
   return best >= minQuantity ? best : 0n;
 }
 
+function resolveQuoteReserve(strategy, bot, marketContext) {
+  const byMarket = (strategy && strategy.quoteReserveUsdByMarket) || {};
+  const raw =
+    strategy && strategy.market && byMarket[strategy.market] !== undefined
+      ? byMarket[strategy.market]
+      : strategy && strategy.quoteReserveUsd !== undefined && strategy.quoteReserveUsd !== null && strategy.quoteReserveUsd !== ''
+        ? strategy.quoteReserveUsd
+        : bot && bot.quoteReserveUsd;
+  if (raw === undefined || raw === null || raw === '') {
+    return 0n;
+  }
+  return parseUsdToQuoteWei(raw, marketContext.quoteDecimals, 'quoteReserveUsd');
+}
+
+function getTradableWalletQuote(strategy, bot, marketContext, quoteWallet) {
+  const reserve = resolveQuoteReserve(strategy, bot, marketContext);
+  if (reserve <= 0n) {
+    return quoteWallet;
+  }
+  return quoteWallet > reserve ? quoteWallet - reserve : 0n;
+}
+
 function getTradableWalletBase(strategy, marketContext, walletBalances) {
   let base = walletBalances.baseWallet;
   if (!marketContext.market.isNativeBase) {
@@ -2045,8 +2152,12 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
   }
 
   const walletBalances = await getWalletBalances(ctx, marketContext);
-  const tradableBase = getTradableWalletBase(strategy, marketContext, walletBalances);
-  const freeQuote = walletBalances.quoteWallet;
+  let vaultBalances = await getVaultBalances(ctx, marketContext);
+  const tradableBaseWallet = getTradableWalletBase(strategy, marketContext, walletBalances);
+  const walletTradableQuote = getTradableWalletQuote(strategy, ctx.bot, marketContext, walletBalances.quoteWallet);
+  let tradableBase = vaultBalances.baseVault + tradableBaseWallet;
+  let freeQuote = vaultBalances.quoteVault + walletTradableQuote;
+  const fundingSource = resolveVolumeMillFundingSource(strategy);
   const crossBps = BigInt(strategy.iocCrossBps ?? strategy.crossBps ?? 5);
   const depthUsageFractionBps = parseDepthUsageFractionBps(strategy.depthUsageFraction);
   const buyPrice = computeIocCrossPrice('bid', top.bestBid, top.bestAsk, marketContext.tickSize, crossBps);
@@ -2072,6 +2183,7 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
 
   const sizePerCycleUsd = resolveSizePerCycleUsd(strategy);
   const sizePerCycleQuote = parseUsdToQuoteWei(sizePerCycleUsd, marketContext.quoteDecimals, 'sizePerCycleUsd');
+  const minRoundTripBps = BigInt(strategy.minRoundTripBps || 0);
 
   async function sellQuantityForCycle(tradableBaseAmount) {
     const targetBase = await estimateBaseQuantityForQuoteBudget(
@@ -2117,6 +2229,23 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
       });
       return false;
     }
+    if (state.lastInventoryBuyPrice !== null && minRoundTripBps >= 0n) {
+      const minimumSellPrice = computeMinimumSellPrice(
+        state.lastInventoryBuyPrice,
+        minRoundTripBps,
+        marketContext.tickSize
+      );
+      if (sellPrice < minimumSellPrice) {
+        ctx.logger.event('takerSkippedBelowCost', {
+          market: strategy.market,
+          sellPrice,
+          minimumSellPrice,
+          lastInventoryBuyPrice: state.lastInventoryBuyPrice,
+          reason,
+        });
+        return false;
+      }
+    }
     ctx.logger.event('volumeMillSizing', {
       market: strategy.market,
       side: 'ask',
@@ -2126,8 +2255,31 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
       tradableBase: sizingMeta.tradableBase ?? null,
       quantity: cappedQty,
       bookSource: top.source,
+      fundingSource,
     });
-    return placeTakerVolumeIoc(ctx, marketContext, strategy, state, 'ask', sellPrice, cappedQty, 'wallet', {
+    if (fundingSource === 'vault') {
+      const funded = await ensureVolumeMillVaultFunding(
+        ctx,
+        marketContext,
+        strategy,
+        vaultBalances,
+        walletBalances,
+        'ask',
+        cappedQty,
+        sellPrice
+      );
+      if (!funded) {
+        ctx.logger.event('volumeMillSkippedVaultFunding', {
+          market: strategy.market,
+          side: 'ask',
+          quantity: cappedQty,
+          reason,
+        });
+        return false;
+      }
+      vaultBalances = funded;
+    }
+    return placeTakerVolumeIoc(ctx, marketContext, strategy, state, 'ask', sellPrice, cappedQty, fundingSource, {
       volumeMill: true,
     });
   }
@@ -2208,7 +2360,8 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
   }
 
   const quoteUsageFractionBps = parseDepthUsageFractionBps(strategy.quoteUsageFraction ?? 0.95);
-  const quoteBudget = [sizePerCycleQuote, (freeQuote * quoteUsageFractionBps) / 10_000n].reduce((min, value) =>
+  const walletQuoteBudget = (walletTradableQuote * quoteUsageFractionBps) / 10_000n;
+  const quoteBudget = [sizePerCycleQuote, walletQuoteBudget + vaultBalances.quoteVault].reduce((min, value) =>
     value < min ? value : min
   );
   if (quoteBudget <= 0n || freeQuote < minBuyQuote) {
@@ -2217,7 +2370,8 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
       sizePerCycleQuote,
       freeQuote,
       minBuyQuote,
-      usableAskDepthQuote,
+      quoteVault: vaultBalances.quoteVault,
+      walletTradableQuote,
     });
     logStuckIfIdle('need_usdso_in_wallet');
     return;
@@ -2260,7 +2414,7 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
       market: strategy.market,
       requiredQuote,
       quoteWallet: walletBalances.quoteWallet,
-      quoteVault: 0n,
+      quoteVault: vaultBalances.quoteVault,
     });
     logStuckIfIdle('insufficient_quote_for_buy');
     return;
@@ -2276,10 +2430,35 @@ async function runVolumeMillTakerStrategy(ctx, strategy, state) {
     askDepthUsd: ethers.formatUnits(askDepthQuote, marketContext.quoteDecimals),
     quantity: buyQuantity,
     bookSource: top.source,
+    fundingSource,
   });
 
-  await placeTakerVolumeIoc(ctx, marketContext, strategy, state, 'bid', buyPrice, buyQuantity, 'wallet', {
+  if (fundingSource === 'vault') {
+    const funded = await ensureVolumeMillVaultFunding(
+      ctx,
+      marketContext,
+      strategy,
+      vaultBalances,
+      walletBalances,
+      'bid',
+      buyQuantity,
+      buyPrice
+    );
+    if (!funded) {
+      ctx.logger.event('volumeMillSkippedVaultFunding', {
+        market: strategy.market,
+        side: 'bid',
+        quantity: buyQuantity,
+        reason: 'ping_pong_buy',
+      });
+      return;
+    }
+    vaultBalances = funded;
+  }
+
+  await placeTakerVolumeIoc(ctx, marketContext, strategy, state, 'bid', buyPrice, buyQuantity, fundingSource, {
     volumeMill: true,
+    trackInventoryCost: true,
   });
 }
 
@@ -2325,6 +2504,8 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
   }
 
   const walletBalances = await getWalletBalances(ctx, marketContext);
+  const tradableQuote = getTradableWalletQuote(strategy, ctx.bot, marketContext, walletBalances.quoteWallet);
+  const takerWalletBalances = { ...walletBalances, quoteWallet: tradableQuote };
   const freeBalances = await getVaultBalances(ctx, marketContext);
   let balances = {
     ...freeBalances,
@@ -2334,7 +2515,7 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
     totalQuoteVault: freeBalances.quoteVault,
   };
   if (strategy.autoFund) {
-    balances = await maybeAutoFundVault(ctx, marketContext, strategy, balances, walletBalances);
+    balances = await maybeAutoFundVault(ctx, marketContext, strategy, balances, takerWalletBalances);
   }
   if (balances.baseVault + walletBalances.baseWallet === 0n && state.lastInventoryBuyPrice !== null) {
     state.lastInventoryBuyPrice = null;
@@ -2366,7 +2547,7 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
 
   let sideLabel = null;
   let funding = null;
-  const askFunding = selectTakerFunding('ask', balances, walletBalances, requiredQuote);
+  const askFunding = selectTakerFunding('ask', balances, takerWalletBalances, requiredQuote);
   const hasAskDustInventory =
     askFunding &&
     askFunding.availableQuantity > 0n &&
@@ -2436,7 +2617,7 @@ async function runTakerVolumeStrategy(ctx, strategy, state) {
     }
   }
   if (!sideLabel) {
-    const bidFunding = selectTakerFunding('bid', balances, walletBalances, requiredQuote);
+    const bidFunding = selectTakerFunding('bid', balances, takerWalletBalances, requiredQuote);
     if (bidFunding) {
       sideLabel = 'bid';
       funding = bidFunding;
