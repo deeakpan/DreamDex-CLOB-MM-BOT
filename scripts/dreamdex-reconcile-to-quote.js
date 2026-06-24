@@ -43,6 +43,8 @@ const SPOT_POOL_ABI = [
   'function getWithdrawableBalance(address owner, address token) view returns (uint256)',
   'function getOwnOpenOrders() view returns (uint128[] memory)',
   'function cancelOrder(uint128 orderId)',
+  'function depositNative() payable',
+  'function deposit(address token, uint256 amount)',
   'function withdraw(address token, uint256 amount)',
   'function withdrawNative(uint256 amount)',
   'function placeOrder(bool isBid, uint64 userData, uint256 price, uint256 quantity, uint64 expireTimestampNs, uint8 orderType, uint8 selfMatchingOption, address builder, uint96 builderFeeBpsTimes1k) returns (bool success, uint128 orderId)',
@@ -69,6 +71,7 @@ function parseCli(argv) {
     dryRun: false,
     skipSell: false,
     somiReserve: '8',
+    targetUsdso: null,
     crossBps: 5,
     markets: null,
   };
@@ -83,6 +86,9 @@ function parseCli(argv) {
       result.skipSell = true;
     } else if (arg === '--somi-reserve') {
       result.somiReserve = argv[i + 1];
+      i += 1;
+    } else if (arg === '--target-usdso') {
+      result.targetUsdso = argv[i + 1];
       i += 1;
     } else if (arg === '--markets') {
       result.markets = argv[i + 1].split(',').map((s) => s.trim());
@@ -236,7 +242,7 @@ async function withdrawVault(ctx, { token, amount, label, isNativeBase, dryRun }
   }
   let tx;
   if (isNativeBase && label.startsWith('base')) {
-    tx = await ctx.poolWrite.withdrawNative(amount);
+    tx = await ctx.poolWrite.withdraw(token, amount);
   } else {
     tx = await ctx.poolWrite.withdraw(token, amount);
   }
@@ -317,7 +323,74 @@ function buildIocSellArgs(price, quantity) {
   ];
 }
 
-async function sellWalletBase(ctx, { quantity, price, dryRun }) {
+async function depositToVault(poolWrite, { token, amount, isNativeBase, label, dryRun }) {
+  if (amount <= 0n) {
+    return;
+  }
+  if (dryRun) {
+    console.log(`  [dry-run] would deposit ${label}: ${amount.toString()}`);
+    return;
+  }
+  const tx = isNativeBase
+    ? await poolWrite.depositNative({ value: amount })
+    : await poolWrite.deposit(token, amount);
+  const receipt = await tx.wait(1);
+  console.log(`  deposited ${label} tx=${receipt.hash}`);
+}
+
+async function sellFromVault(mc, signer, { quantity, price, dryRun }) {
+  if (quantity < mc.minQuantity) {
+    console.log(`  skip vault sell: qty ${quantity} below min ${mc.minQuantity}`);
+    return null;
+  }
+  const owner = await signer.getAddress();
+  const args = buildIocSellArgs(price, quantity);
+  const vaultBase = await mc.poolRead.getWithdrawableBalance(owner, mc.baseToken);
+  const depositAmount = quantity > vaultBase ? quantity - vaultBase : 0n;
+  if (depositAmount > 0n) {
+    if (!mc.market.isNativeBase) {
+      await ensureApproval(signer, mc.baseTokenContract, mc.market.pool, depositAmount, dryRun);
+    }
+    await depositToVault(mc.poolWrite, {
+      token: mc.baseToken,
+      amount: depositAmount,
+      isNativeBase: mc.market.isNativeBase,
+      label: fmt(depositAmount, mc.baseDecimals, mc.baseSymbol),
+      dryRun,
+    });
+  }
+  const ok = await mc.poolWrite.placeOrder.staticCall(...args);
+  if (!ok[0]) {
+    console.log(`  vault sell simulation rejected (qty=${quantity})`);
+    return null;
+  }
+  if (dryRun) {
+    console.log(`  [dry-run] would IOC vault sell ${quantity} @ ${price}`);
+    return { dryRun: true };
+  }
+  const tx = await mc.poolWrite.placeOrder(...args);
+  const receipt = await tx.wait(1);
+  console.log(`  sold ${quantity} @ ${price} (vault) tx=${receipt.hash}`);
+  return receipt;
+}
+
+async function sellWalletBase(ctx, { quantity, price, dryRun, useVault }) {
+  if (useVault) {
+    return sellFromVault(
+      {
+        market: ctx.market,
+        poolRead: ctx.poolRead,
+        poolWrite: ctx.poolWrite,
+        baseToken: ctx.baseToken,
+        baseTokenContract: ctx.baseTokenContract,
+        minQuantity: ctx.minQuantity,
+        baseDecimals: ctx.baseDecimals,
+        baseSymbol: ctx.baseSymbol,
+      },
+      ctx.signer,
+      { quantity, price, dryRun }
+    );
+  }
   if (quantity < ctx.minQuantity) {
     console.log(`  skip sell: qty ${quantity} below min ${ctx.minQuantity}`);
     return null;
@@ -345,7 +418,7 @@ async function sellWalletBase(ctx, { quantity, price, dryRun }) {
 }
 
 async function reconcileMarket(mc, signer, options) {
-  const { symbol, somiReserveWei, dryRun, skipSell, crossBps, networkConfig } = options;
+  const { symbol, somiReserveWei, targetUsdso, dryRun, skipSell, crossBps, networkConfig } = options;
   console.log(`\n${symbol}`);
   const owner = await signer.getAddress();
 
@@ -387,6 +460,27 @@ async function reconcileMarket(mc, signer, options) {
   const walletQtyBeforeLot = walletQty;
   walletQty = alignToLot(walletQty, mc.lotSize);
 
+  if (targetUsdso !== null && symbol === 'SOMI:USDso') {
+    const quoteWallet = await mc.quoteTokenContract.balanceOf(owner);
+    const targetQuote = ethers.parseUnits(String(targetUsdso), mc.quoteDecimals);
+    if (quoteWallet >= targetQuote) {
+      console.log(`  USDso already at target (${fmt(quoteWallet, mc.quoteDecimals, mc.quoteSymbol)})`);
+      return;
+    }
+    const quoteNeeded = targetQuote - quoteWallet;
+    const wad = 1_000_000_000_000_000_000n;
+    let qtyForTarget = alignToLot((quoteNeeded * wad) / sellPrice, mc.lotSize);
+    if (qtyForTarget < mc.minQuantity) {
+      qtyForTarget = alignToLot(mc.minQuantity, mc.lotSize);
+    }
+    if (qtyForTarget < walletQty) {
+      walletQty = qtyForTarget;
+    }
+    console.log(
+      `  target USDso=${targetUsdso} need≈${fmt(quoteNeeded, mc.quoteDecimals, mc.quoteSymbol)} sellQty=${fmt(walletQty, mc.baseDecimals, mc.baseSymbol)}`
+    );
+  }
+
   if (mc.market.isNativeBase) {
     console.log(
       `  native=${fmt(walletQtyBeforeReserve, mc.baseDecimals, mc.baseSymbol)} reserve=${fmt(somiReserveWei, mc.baseDecimals, mc.baseSymbol)} sellable=${fmt(walletQtyBeforeLot, mc.baseDecimals, mc.baseSymbol)} aligned=${fmt(walletQty, mc.baseDecimals, mc.baseSymbol)} min=${fmt(mc.minQuantity, mc.baseDecimals, mc.baseSymbol)}`
@@ -400,12 +494,16 @@ async function reconcileMarket(mc, signer, options) {
     await sellWalletBase(
       {
         market: mc.market,
+        poolRead: mc.poolRead,
         poolWrite: mc.poolWrite,
+        baseToken: mc.baseToken,
         baseTokenContract: mc.baseTokenContract,
         minQuantity: mc.minQuantity,
+        baseDecimals: mc.baseDecimals,
+        baseSymbol: mc.baseSymbol,
         signer,
       },
-      { quantity: walletQty, price: sellPrice, dryRun }
+      { quantity: walletQty, price: sellPrice, dryRun, useVault: mc.market.isNativeBase }
     );
   } else {
     console.log(`  nothing to sell from wallet (qty=${walletQty})`);
@@ -441,6 +539,7 @@ async function main() {
         network: networkName,
         markets,
         somiReserve: cli.somiReserve,
+        targetUsdso: cli.targetUsdso,
         dryRun: cli.dryRun,
         skipSell: cli.skipSell,
         steps: ['cancel_orders', 'withdraw_vault', cli.skipSell ? null : 'sell_wallet_base'].filter(Boolean),
@@ -455,6 +554,7 @@ async function main() {
     await reconcileMarket(mc, signer, {
       symbol,
       somiReserveWei,
+      targetUsdso: cli.targetUsdso,
       dryRun: cli.dryRun,
       skipSell: cli.skipSell,
       crossBps: cli.crossBps,
