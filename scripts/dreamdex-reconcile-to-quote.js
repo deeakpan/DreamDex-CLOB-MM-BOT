@@ -503,7 +503,7 @@ async function reconcileMarket(mc, signer, options) {
         baseSymbol: mc.baseSymbol,
         signer,
       },
-      { quantity: walletQty, price: sellPrice, dryRun, useVault: mc.market.isNativeBase }
+      { quantity: walletQty, price: sellPrice, dryRun, useVault: true }
     );
   } else {
     console.log(`  nothing to sell from wallet (qty=${walletQty})`);

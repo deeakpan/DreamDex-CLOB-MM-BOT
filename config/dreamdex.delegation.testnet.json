@@ -1,0 +1,37 @@
+{
+  "label": "testnet",
+  "chainId": 50312,
+  "rpcUrls": [
+    "https://api.infra.testnet.somnia.network",
+    "https://dream-rpc.somnia.network"
+  ],
+  "restUrl": "https://stg.api.dreamdex.io",
+  "defaultMarket": "SOMI:USDso",
+  "markets": {
+    "SOMI:USDso": {
+      "symbol": "SOMI:USDso",
+      "pool": "0x259fD6559214dd5aD3752322426eA9F9fABEFff4",
+      "isNativeBase": true
+    },
+    "WETH:USDso": {
+      "symbol": "WETH:USDso",
+      "pool": "0xD180195da5459C7a0DEA188ed61216ec43682b50",
+      "isNativeBase": false
+    },
+    "WBTC:USDso": {
+      "symbol": "WBTC:USDso",
+      "pool": "0x3605f28aA7C50e7441211e77Cb0762d49539326C",
+      "isNativeBase": false
+    }
+  },
+  "defaults": {
+    "funding": "native",
+    "sizePerCycleUsd": "5.00",
+    "iocCrossBps": 5,
+    "quoteDepositBufferBps": 50,
+    "nativeSellBufferBps": 150,
+    "gasReserveStt": "5",
+    "expireSecondsFromNow": 3600,
+    "loopIntervalMs": 3000
+  }
+}

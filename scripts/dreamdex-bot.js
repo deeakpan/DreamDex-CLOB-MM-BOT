@@ -2,7 +2,10 @@
 
 const fs = require('fs');
 const path = require('path');
-require('dotenv').config({ path: path.resolve(process.cwd(), '.env') });
+const envPath = path.resolve(process.cwd(), '.env');
+if (fs.existsSync(envPath)) {
+  require('dotenv').config({ path: envPath, quiet: true });
+}
 const { ethers } = require('ethers');
 const WebSocket = require('ws');
 const {
@@ -367,7 +370,20 @@ function toUint64(value, fieldName) {
   return value;
 }
 
-function resolveNetworkName(config, networkOverride) {
+function describePrivateKeyEnv(envVar) {
+  const raw = process.env[envVar];
+  if (raw === undefined) {
+    return `${envVar} is not set in process.env`;
+  }
+  if (raw === '') {
+    return `${envVar} is set but empty`;
+  }
+  const normalized = normalizePrivateKey(raw);
+  if (!normalized) {
+    return `${envVar} is set (length=${raw.length}) but could not be parsed as a private key`;
+  }
+  return null;
+}
   const networkName = networkOverride || config.network;
   if (!networkName || !DEFAULT_NETWORKS[networkName]) {
     throw new Error(`Unsupported network: ${networkName}`);
@@ -2887,7 +2903,10 @@ async function main() {
   const privateKeyEnvVar = ((config.wallet || {}).privateKeyEnvVar || 'PRIVATE_KEY');
 
   if (!signer) {
-    throw new Error(`Bot requires a wallet. Set ${privateKeyEnvVar} in your environment.`);
+    const detail = describePrivateKeyEnv(privateKeyEnvVar);
+    throw new Error(
+      `Bot requires a wallet. Set ${privateKeyEnvVar} in your environment (Railway service variables). ${detail}.`
+    );
   }
 
   const onChainNetwork = await provider.getNetwork();
