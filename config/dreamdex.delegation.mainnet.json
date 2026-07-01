@@ -35,7 +35,7 @@
     "sizePerCycleUsd": "25.00",
     "iocCrossBps": 5,
     "quoteDepositBufferBps": 50,
-    "gasReserveNative": "10",
+    "gasReserveNative": "6",
     "expireSecondsFromNow": 3600,
     "loopIntervalMs": 3000
   }
