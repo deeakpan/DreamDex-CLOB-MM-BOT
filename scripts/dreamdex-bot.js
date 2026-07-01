@@ -384,8 +384,13 @@ function describePrivateKeyEnv(envVar) {
   }
   return null;
 }
+
+function resolveNetworkName(config, networkOverride) {
   const networkName = networkOverride || config.network;
-  if (!networkName || !DEFAULT_NETWORKS[networkName]) {
+  if (!networkName) {
+    throw new Error('Missing network. Set `network` in config or pass --network.');
+  }
+  if (!DEFAULT_NETWORKS[networkName]) {
     throw new Error(`Unsupported network: ${networkName}`);
   }
   return networkName;
